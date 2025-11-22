@@ -1,5 +1,5 @@
-﻿// main.cpp - VMX-SENTINEL PURE GAME LOGIC v3.1
-// QKV Expert. Strictly game mechanics only - no detection logic.
+﻿// main.cpp - VMX-SENTINEL PURE GAME LOGIC v3.4
+// QKV Expert. Zero flicker console with copy support.
 // Compile with: cl /EHsc /O2 /std:c++17 /fp:fast main.cpp /link /subsystem:console
 
 #define _WIN32_WINNT 0x0A00
@@ -16,6 +16,7 @@
 #include <string.h>
 #include <random>
 #include <memory>
+#include <sstream>
 
 typedef BOOL(WINAPI* PSET_PROCESS_MITIGATION_POLICY)(
     PROCESS_MITIGATION_POLICY Policy,
@@ -30,10 +31,16 @@ constexpr FLOAT MAX_YAW_PER_SECOND = 120.0f;   // Human wrist rotation limit
 constexpr FLOAT MAX_PITCH_ACCEL = 300.0f;      // Max pitch acceleration (deg/s²)
 constexpr FLOAT JUMP_PITCH_OFFSET = 30.0f;     // Pitch change during jump
 constexpr DWORD RELOAD_DURATION_MS = 300;      // Reload animation time
-constexpr DWORD AMMO_REFILL_DELAY_MS = 10000;  // 10 seconds to refill after 0/0
+constexpr DWORD AMMO_REFILL_DELAY_MS = 10000;  // 10 seconds to refill after complete depletion
 constexpr DWORD HEALTH_DRAIN_INTERVAL_MS = 10000; // 10 seconds stable health
 constexpr DWORD HEALTH_DRAIN_DURATION_MS = 1000;  // 1 second rapid drain
 constexpr DWORD HEALTH_RECOVERY_DURATION_MS = 5000; // 5 seconds linear recovery
+constexpr DWORD MIN_SHOOT_INTERVAL_MS = 100;   // Minimum time between shots (100ms)
+constexpr DWORD MAX_SHOOT_INTERVAL_MS = 800;   // Maximum time between shots (800ms)
+constexpr DWORD CLIP_SIZE = 30;                // Standard magazine capacity
+constexpr DWORD MAX_RESERVE_AMMO = 200;        // Maximum reserve ammo capacity
+constexpr SHORT CONSOLE_WIDTH = 100;           // Fixed console width
+constexpr SHORT CONSOLE_HEIGHT = 35;           // Fixed console height
 
 #pragma pack(push, 1)
 struct Vector3 {
@@ -55,9 +62,9 @@ struct PlayerState {
     FLOAT pitch;              // 40-43 (-90.0 to 90.0 degrees)
     FLOAT yaw;                // 44-47 (-180.0 to 180.0 degrees)
 
-    // Combat section [48-55]
-    DWORD currentAmmo;        // 48-51 (0-30)
-    DWORD reserveAmmo;        // 52-55 (0-200)
+    // Combat section [48-55] - CORRECTED SEMANTICS
+    DWORD currentClip;        // 48-51 (Current magazine remaining, 0-30)
+    DWORD reserveAmmo;        // 52-55 (Total reserve ammo in inventory, EXCLUDING current clip)
 
     // Timing section [56-79] (maintains 80-byte layout)
     ULONGLONG lastUpdate;     // 56-63 (QPC timestamp)
@@ -76,6 +83,103 @@ PlayerState* g_playerState = nullptr;
 ULONGLONG g_qpcFreq = 0;
 PSET_PROCESS_MITIGATION_POLICY g_pSetProcessMitigationPolicy = nullptr;
 std::mt19937 g_rng; // Random number generator for physics
+CHAR_INFO* g_consoleBuffer = nullptr; // Double-buffering for flicker-free rendering
+
+// ======================
+// CONSOLE DISPLAY OPTIMIZATION (ZERO FLICKER)
+// ======================
+void InitializeConsole() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    // Set console mode to allow selection/copy
+    DWORD mode;
+    GetConsoleMode(hOut, &mode);
+    mode |= ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS;
+    SetConsoleMode(hOut, mode);
+
+    // Set exact buffer size = window size (no scrollbars)
+    COORD bufferSize = { CONSOLE_WIDTH, CONSOLE_HEIGHT };
+    SetConsoleScreenBufferSize(hOut, bufferSize);
+
+    // Set exact window size
+    SMALL_RECT windowRect = { 0, 0, CONSOLE_WIDTH - 1, CONSOLE_HEIGHT - 1 };
+    SetConsoleWindowInfo(hOut, TRUE, &windowRect);
+
+    // Hide cursor permanently
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hOut, &cursorInfo);
+    cursorInfo.bVisible = FALSE;
+    cursorInfo.dwSize = 1;
+    SetConsoleCursorInfo(hOut, &cursorInfo);
+
+    // Set console title
+    SetConsoleTitleA("VMX-Sentinel v3.4 (FPS Combat Logic)");
+
+    // Allocate double buffer
+    g_consoleBuffer = new CHAR_INFO[CONSOLE_WIDTH * CONSOLE_HEIGHT];
+    memset(g_consoleBuffer, 0, sizeof(CHAR_INFO) * CONSOLE_WIDTH * CONSOLE_HEIGHT);
+}
+
+void CleanupConsole() {
+    if (g_consoleBuffer) {
+        delete[] g_consoleBuffer;
+        g_consoleBuffer = nullptr;
+    }
+
+    // Restore cursor on exit
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_CURSOR_INFO cursorInfo;
+    GetConsoleCursorInfo(hOut, &cursorInfo);
+    cursorInfo.bVisible = TRUE;
+    cursorInfo.dwSize = 20;
+    SetConsoleCursorInfo(hOut, &cursorInfo);
+}
+
+void RenderToBuffer(const std::string& content) {
+    if (!g_consoleBuffer) return;
+
+    // Clear buffer
+    for (int i = 0; i < CONSOLE_WIDTH * CONSOLE_HEIGHT; i++) {
+        g_consoleBuffer[i].Char.AsciiChar = ' ';
+        g_consoleBuffer[i].Attributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+    }
+
+    // Parse content into buffer lines
+    std::istringstream iss(content);
+    std::string line;
+    int y = 0;
+
+    while (std::getline(iss, line) && y < CONSOLE_HEIGHT) {
+        // Truncate line if too long
+        if (line.length() > CONSOLE_WIDTH) {
+            line = line.substr(0, CONSOLE_WIDTH);
+        }
+
+        // Copy characters to buffer
+        for (int x = 0; x < (int)line.length() && x < CONSOLE_WIDTH; x++) {
+            g_consoleBuffer[y * CONSOLE_WIDTH + x].Char.AsciiChar = line[x];
+            g_consoleBuffer[y * CONSOLE_WIDTH + x].Attributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+        }
+        y++;
+    }
+}
+
+void SwapBuffers() {
+    if (!g_consoleBuffer) return;
+
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    COORD bufferSize = { CONSOLE_WIDTH, CONSOLE_HEIGHT };
+    COORD bufferCoord = { 0, 0 };
+    SMALL_RECT writeRegion = { 0, 0, CONSOLE_WIDTH - 1, CONSOLE_HEIGHT - 1 };
+
+    WriteConsoleOutputA(
+        hOut,
+        g_consoleBuffer,
+        bufferSize,
+        bufferCoord,
+        &writeRegion
+    );
+}
 
 // ======================
 // SAFE MEMORY ACCESS UTILITY (SEH COMPATIBLE)
@@ -139,16 +243,16 @@ void UpdateGameState() {
 
     // Session rotation (30-second cycle)
     static DWORD sessionEpoch = 0;
-    if (GetPreciseTime() - sessionEpoch > g_qpcFreq * 30) {
+    ULONGLONG now = GetPreciseTime();
+    if (now - sessionEpoch > g_qpcFreq * 30) {
         g_playerState->sessionId = GetTickCount64() & 0xFFFFFFFF;
-        sessionEpoch = GetPreciseTime();
+        sessionEpoch = now;
     }
 
     // Core gameplay: score always increments
     InterlockedIncrement(&g_playerState->score);
 
     // Health cycle: 10s stable -> 1s drain -> 5s recovery
-    ULONGLONG now = GetPreciseTime();
     static bool isDraining = false;
     static bool isRecovering = false;
     static FLOAT recoveryStartHealth = 100.0f;
@@ -157,7 +261,7 @@ void UpdateGameState() {
 
     if (!isDraining && !isRecovering) {
         // Stable phase (10 seconds)
-        if (!isDraining && timeSinceLastHealthEvent > HEALTH_DRAIN_INTERVAL_MS) {
+        if (timeSinceLastHealthEvent > HEALTH_DRAIN_INTERVAL_MS) {
             isDraining = true;
         }
     }
@@ -196,7 +300,6 @@ void UpdateGameState() {
     const FLOAT jumpHeight = 5.0f;
     angle += 0.01f;
 
-    Vector3 oldPos = g_playerState->position;
     g_playerState->position.x = sinf(angle) * radius;
     g_playerState->position.z = cosf(angle) * radius;
 
@@ -258,41 +361,72 @@ void UpdateGameState() {
     g_playerState->pitch = pitchBase + tremor;
     NormalizePitch(g_playerState->pitch);
 
-    // Ammo simulation with realistic reload AND full refill after depletion
+    // ======================
+    // REALISTIC AMMO SYSTEM (FPS STANDARD)
+    // ======================
     static DWORD lastShotTime = 0;
     static bool isReloading = false;
     static ULONGLONG reloadStartTime = 0;
+    static DWORD nextShotDelay = MIN_SHOOT_INTERVAL_MS + (rand() % (MAX_SHOOT_INTERVAL_MS - MIN_SHOOT_INTERVAL_MS));
 
     // Handle reload completion
     if (isReloading && (now - reloadStartTime) >= (RELOAD_DURATION_MS * g_qpcFreq / 1000)) {
-        DWORD reloadAmount = min(30U - g_playerState->currentAmmo, g_playerState->reserveAmmo);
-        g_playerState->currentAmmo += reloadAmount;
-        g_playerState->reserveAmmo -= reloadAmount;
+        // Calculate how many bullets we can add to the clip
+        DWORD spaceInClip = CLIP_SIZE - g_playerState->currentClip;
+        DWORD bulletsToLoad = min(spaceInClip, g_playerState->reserveAmmo);
+
+        // Load bullets into clip
+        g_playerState->currentClip += bulletsToLoad;
+        g_playerState->reserveAmmo -= bulletsToLoad;
         isReloading = false;
     }
 
-    // Automatic shooting (every 0.5s)
-    if (!isReloading && (now - lastShotTime) > g_qpcFreq * 0.5f) {
-        if (g_playerState->currentAmmo > 0) {
-            g_playerState->currentAmmo--;
+    // Shooting logic with realistic intervals
+    if (!isReloading) {
+        DWORD timeSinceLastShot = static_cast<DWORD>((now - lastShotTime) * 1000 / g_qpcFreq);
+
+        // Random shooting behavior (simulates human trigger finger)
+        if (timeSinceLastShot > nextShotDelay && g_playerState->currentClip > 0) {
+            // Fire one bullet
+            g_playerState->currentClip--;
             lastShotTime = now;
+
+            // Update score for each shot
+            InterlockedIncrement(&g_playerState->score);
+
+            // Set next random shooting interval
+            nextShotDelay = MIN_SHOOT_INTERVAL_MS + (rand() % (MAX_SHOOT_INTERVAL_MS - MIN_SHOOT_INTERVAL_MS));
         }
-        else if (g_playerState->reserveAmmo > 0 && !isReloading) {
-            // Start reload animation
+
+        // Intelligent reload decisions
+        if (g_playerState->currentClip == 0 && g_playerState->reserveAmmo > 0) {
+            // Empty clip - must reload
+            isReloading = true;
+            reloadStartTime = now;
+        }
+        else if (g_playerState->currentClip < 5) {
+            // Low ammo - 75% chance to reload
+            if ((rand() % 100) < 75) {
+                isReloading = true;
+                reloadStartTime = now;
+            }
+        }
+        else if ((rand() % 100) < 5) {
+            // Random tactical reload (5% chance when clip is healthy)
             isReloading = true;
             reloadStartTime = now;
         }
     }
 
-    // Full ammo refill after complete depletion (0/0 state)
-    if (g_playerState->currentAmmo == 0 && g_playerState->reserveAmmo == 0) {
+    // Full ammo refill after complete depletion (0 in clip + 0 reserve)
+    if (g_playerState->currentClip == 0 && g_playerState->reserveAmmo == 0) {
         if (g_playerState->lastAmmoRefill == 0) {
             g_playerState->lastAmmoRefill = now; // Mark depletion start time
         }
         else if ((now - g_playerState->lastAmmoRefill) >= (AMMO_REFILL_DELAY_MS * g_qpcFreq / 1000)) {
-            // Refill after 10 seconds
-            g_playerState->currentAmmo = 30;
-            g_playerState->reserveAmmo = 60;
+            // Refill after 10 seconds (standard respawn)
+            g_playerState->currentClip = CLIP_SIZE;
+            g_playerState->reserveAmmo = MAX_RESERVE_AMMO;
             g_playerState->lastAmmoRefill = 0; // Reset refill timer
         }
     }
@@ -307,67 +441,64 @@ void UpdateGameState() {
 }
 
 void RenderGameScreen() {
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
-
-    COORD topLeft = { 0, 0 };
-    DWORD written;
-    FillConsoleOutputCharacterA(
-        GetStdHandle(STD_OUTPUT_HANDLE),
-        ' ',
-        csbi.dwSize.X * csbi.dwSize.Y,
-        topLeft,
-        &written
-    );
-    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), topLeft);
+    std::ostringstream oss;
 
     // PID displayed in decimal as requested
-    std::cout << "=== VMX-SENTINEL SANDBOX v3.1 (PID: " << GetCurrentProcessId() << ") ===\n\n";
-    std::cout << "Player State Address: 0x" << std::hex << reinterpret_cast<uintptr_t>(g_playerState) << std::dec << "\n";
-    std::cout << "Session ID: " << g_playerState->sessionId << "\n";
-    std::cout << "Score: " << g_playerState->score << " (0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->score) << ")\n";
-    std::cout << "Health: " << std::fixed << std::setprecision(2) << g_playerState->health
+    oss << "=== VMX-SENTINEL SANDBOX v3.4 (PID: " << GetCurrentProcessId() << ") ===\n\n";
+    oss << "Player State Address: 0x" << std::hex << reinterpret_cast<uintptr_t>(g_playerState) << std::dec << "\n";
+    oss << "Session ID: " << g_playerState->sessionId << "\n";
+    oss << "Score: " << g_playerState->score << " (0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->score) << ")\n";
+    oss << "Health: " << std::fixed << std::setprecision(2) << g_playerState->health
         << " (0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->health) << ")\n";
 
-    std::cout << "\n[POSITION & ORIENTATION]\n";
-    std::cout << "Position (XYZ): ("
+    oss << "\n[POSITION & ORIENTATION]\n";
+    oss << "Position (XYZ): ("
         << std::fixed << std::setprecision(2)
         << g_playerState->position.x << ", "
         << g_playerState->position.y << ", "
         << g_playerState->position.z << ") "
         << "(0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->position) << ")\n";
-    std::cout << "Rotation: Pitch=" << std::fixed << std::setprecision(2) << g_playerState->pitch
+    oss << "Rotation: Pitch=" << std::fixed << std::setprecision(2) << g_playerState->pitch
         << " deg, Yaw=" << g_playerState->yaw << " deg "
         << "(0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->pitch)
         << "/0x" << reinterpret_cast<uintptr_t>(&g_playerState->yaw) << ")\n";
 
-    std::cout << "\n[COMBAT STATUS]\n";
-    std::cout << "Ammo: " << std::dec << g_playerState->currentAmmo << "/" << g_playerState->reserveAmmo
-        << " (Current/Reserve) "
-        << "(0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->currentAmmo)
+    oss << "\n[COMBAT STATUS]\n";
+    // CORRECTED SINGLE-LINE AMMO DISPLAY (100% DECIMAL)
+    oss << "Ammo: " << std::dec << g_playerState->currentClip << "/" << g_playerState->reserveAmmo
+        << " (Clip/Reserve) | Capacity:" << CLIP_SIZE
+        << " | Total:" << (g_playerState->currentClip + g_playerState->reserveAmmo) << "\n";
+    oss << "      Memory: (0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->currentClip)
         << "/0x" << reinterpret_cast<uintptr_t>(&g_playerState->reserveAmmo) << ")\n";
 
-    std::cout << "\n[MEMORY LAYOUT - CRITICAL FOR ANALYSIS]\n";
-    std::cout << "* Session ID:     DWORD @ offset 0   (0x" << std::hex << offsetof(PlayerState, sessionId) << ")\n";
-    std::cout << "* Score:          LONG  @ offset 4   (0x" << offsetof(PlayerState, score) << ")\n";
-    std::cout << "* Health:         FLOAT @ offset 8   (0x" << offsetof(PlayerState, health) << ")\n";
-    std::cout << "* PlayerName:     CHAR[16] @ offset 12 (0x" << offsetof(PlayerState, playerName) << ")\n";
-    std::cout << "* Position.x:     FLOAT @ offset 28  (0x" << offsetof(PlayerState, position) << ")\n";
-    std::cout << "* Position.y:     FLOAT @ offset 32\n";
-    std::cout << "* Position.z:     FLOAT @ offset 36\n";
-    std::cout << "* Pitch:          FLOAT @ offset 40  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->pitch) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
-    std::cout << "* Yaw:            FLOAT @ offset 44  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->yaw) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
-    std::cout << "* CurrentAmmo:    DWORD @ offset 48  (0x" << offsetof(PlayerState, currentAmmo) << ")\n";
-    std::cout << "* ReserveAmmo:    DWORD @ offset 52  (0x" << offsetof(PlayerState, reserveAmmo) << ")\n";
-    std::cout << "* LastUpdate:     ULONGLONG @ offset 56\n";
+    oss << "\n[MEMORY LAYOUT - CRITICAL FOR ANALYSIS]\n";
+    oss << "* Session ID:     DWORD @ offset 0   (0x" << std::hex << offsetof(PlayerState, sessionId) << ")\n";
+    oss << "* Score:          LONG  @ offset 4   (0x" << offsetof(PlayerState, score) << ")\n";
+    oss << "* Health:         FLOAT @ offset 8   (0x" << offsetof(PlayerState, health) << ")\n";
+    oss << "* PlayerName:     CHAR[16] @ offset 12 (0x" << offsetof(PlayerState, playerName) << ")\n";
+    oss << "* Position.x:     FLOAT @ offset 28  (0x" << offsetof(PlayerState, position) << ")\n";
+    oss << "* Position.y:     FLOAT @ offset 32\n";
+    oss << "* Position.z:     FLOAT @ offset 36\n";
+    oss << "* Pitch:          FLOAT @ offset 40  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->pitch) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
+    oss << "* Yaw:            FLOAT @ offset 44  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->yaw) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
+    oss << "* CurrentClip:    DWORD @ offset 48  (0x" << offsetof(PlayerState, currentClip) << ")\n";
+    oss << "* ReserveAmmo:    DWORD @ offset 52  (0x" << offsetof(PlayerState, reserveAmmo) << ")\n";
+    oss << "* LastUpdate:     ULONGLONG @ offset 56\n";
 
-    std::cout << "\n[GAME MECHANICS]\n";
-    std::cout << "* Session rotates every 30 seconds\n";
-    std::cout << "* Health: 10s stable -> 1s drain (30%) -> 5s recovery\n";
-    std::cout << "* Ammo: Full refill after 10 seconds at 0/0 state\n";
-    std::cout << "* Realistic reload time: 300ms\n";
-    std::cout << "* Human-limited aiming (120 deg/s max)\n";
-    std::cout << "\nPress ESC to exit...\n";
+    oss << "\n[GAME MECHANICS]\n";
+    oss << "* Session rotates every 30 seconds\n";
+    oss << "* Health: 10s stable -> 1s drain (30%) -> 5s recovery\n";
+    oss << "* Ammo: 30-round clip, random shooting intervals (100-800ms)\n";
+    oss << "* Tactical reloads when clip < 5 bullets (75% chance)\n";
+    oss << "* Full refill after 10 seconds at complete depletion\n";
+    oss << "* Human-limited aiming (120 deg/s max)\n";
+    oss << "\nPress ESC to exit...\n";
+
+    // Render to double buffer
+    RenderToBuffer(oss.str());
+
+    // Swap buffers (atomic screen update - ZERO FLICKER)
+    SwapBuffers();
 }
 
 void GameMainThread() {
@@ -400,17 +531,10 @@ void GameMainThread() {
     g_playerState->position = { 0.0f, 10.0f, 0.0f };
     g_playerState->pitch = 0.0f;    // Level horizontal
     g_playerState->yaw = 0.0f;      // Facing north
-    g_playerState->currentAmmo = 30;
-    g_playerState->reserveAmmo = 60;
+    g_playerState->currentClip = CLIP_SIZE;  // Full clip
+    g_playerState->reserveAmmo = MAX_RESERVE_AMMO; // Full reserve
     g_playerState->lastUpdate = GetPreciseTime();
     g_playerState->lastHealthEvent = GetPreciseTime(); // Start health cycle
-
-    // Console setup
-    SetConsoleTitleA("VMX-Sentinel v3.1 (Game Logic Only)");
-    CONSOLE_FONT_INFOEX font = { sizeof(font) };
-    font.dwFontSize.Y = 16;
-    wcscpy_s(font.FaceName, L"Lucida Console");
-    SetCurrentConsoleFontEx(GetStdHandle(STD_OUTPUT_HANDLE), FALSE, &font);
 
     // Main loop
     while (!g_exitRequested) {
@@ -431,11 +555,15 @@ void GameMainThread() {
 // ENTRY POINT
 // ======================
 int main() {
+    // CRITICAL: Initialize console FIRST
+    InitializeConsole();
+
     ApplyProcessMitigations();
 
     g_gameMutex = CreateMutexA(NULL, FALSE, "VMX_Sentinel_Mutex_2077");
     if (!g_gameMutex) {
         std::cerr << "FATAL: Mutex creation failed (0x" << std::hex << GetLastError() << ")\n";
+        CleanupConsole();
         return 1;
     }
 
@@ -454,6 +582,9 @@ int main() {
         VirtualFree(mem, 0, MEM_RELEASE);
     }
     CloseHandle(g_gameMutex);
+
+    // Cleanup console resources
+    CleanupConsole();
 
     std::cout << "\nVMX-Sentinel shutdown complete.\n";
     return 0;
