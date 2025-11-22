@@ -56,9 +56,9 @@ Offset  Size  Type       Field           Description
 
 ## Competition Roles
 
-- **:red_circle: Red Team (G-Teacher)**: Develop hypervisor-level attacks to manipulate game state from VMX root mode
-- **:blue_circle: Blue Team (Lightweight)**: Create detection mechanisms for unauthorized memory access and hypervisor tampering
-- **:black_circle: Expert Team (QKV)**: Provide architectural analysis and advanced technique evaluation
+- **🔴 Red Team (G老师)**: Develop hypervisor-level attacks to manipulate game state from VMX root mode  
+- **🔵 Blue Team (轻子)**: Create detection mechanisms for unauthorized memory access and hypervisor tampering  
+- **⚫ Expert Team (QKV)**: Provide architectural analysis and advanced technique evaluation
 
 ## Build Instructions
 
