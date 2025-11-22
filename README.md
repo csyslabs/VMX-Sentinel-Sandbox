@@ -72,12 +72,12 @@ Offset  Size  Type       Field           Description
 cl /EHsc /O2 /std:c++17 /fp:fast main.cpp /link /subsystem:console
 
 # Output
-# - main.exe (VMX-SENTINEL executable)
+# - VMX-Sentinel.exe (VMX-SENTINEL executable)
 ```
 
 ## Usage
 
-1. Execute `main.exe` to launch the sandbox environment
+1. Execute `VMX-Sentinel.exe` to launch the sandbox environment
 2. The console interface will automatically size to 120×40 characters
 3. All memory addresses and offsets are displayed for analysis purposes
 4. Press `ESC` to terminate the application gracefully
