@@ -1,5 +1,5 @@
-﻿// main.cpp - VMX-SENTINEL SEH COMPATIBILITY FIX
-// QKV Expert.
+﻿// main.cpp - VMX-SENTINEL PURE GAME LOGIC v3.1
+// QKV Expert. Strictly game mechanics only - no detection logic.
 // Compile with: cl /EHsc /O2 /std:c++17 /fp:fast main.cpp /link /subsystem:console
 
 #define _WIN32_WINNT 0x0A00
@@ -30,6 +30,10 @@ constexpr FLOAT MAX_YAW_PER_SECOND = 120.0f;   // Human wrist rotation limit
 constexpr FLOAT MAX_PITCH_ACCEL = 300.0f;      // Max pitch acceleration (deg/s²)
 constexpr FLOAT JUMP_PITCH_OFFSET = 30.0f;     // Pitch change during jump
 constexpr DWORD RELOAD_DURATION_MS = 300;      // Reload animation time
+constexpr DWORD AMMO_REFILL_DELAY_MS = 10000;  // 10 seconds to refill after 0/0
+constexpr DWORD HEALTH_DRAIN_INTERVAL_MS = 10000; // 10 seconds stable health
+constexpr DWORD HEALTH_DRAIN_DURATION_MS = 1000;  // 1 second rapid drain
+constexpr DWORD HEALTH_RECOVERY_DURATION_MS = 5000; // 5 seconds linear recovery
 
 #pragma pack(push, 1)
 struct Vector3 {
@@ -38,16 +42,16 @@ struct Vector3 {
     FLOAT z;
 };
 
-// PRECISE 80-BYTE LAYOUT (FPS PHYSICS OPTIMIZED)
+// PRECISE 80-BYTE LAYOUT (FPS PHYSICS OPTIMIZED) - PRESERVED OFFSETS
 struct PlayerState {
     // Core identity section [0-27]
-    DWORD sessionId;          // 0-3
-    volatile LONG score;      // 4-7
-    FLOAT health;             // 8-11
-    CHAR playerName[16];      // 12-27 (16 bytes)
+    DWORD sessionId;          // 0-3   (DWORD)
+    volatile LONG score;      // 4-7   (LONG)
+    FLOAT health;             // 8-11  (FLOAT)
+    CHAR playerName[16];      // 12-27 (16 bytes CHAR array)
 
     // Position & orientation section [28-47] (SIMD ALIGNED)
-    Vector3 position;         // 28-39 (12 bytes)
+    Vector3 position;         // 28-39 (12 bytes: x=28-31, y=32-35, z=36-39)
     FLOAT pitch;              // 40-43 (-90.0 to 90.0 degrees)
     FLOAT yaw;                // 44-47 (-180.0 to 180.0 degrees)
 
@@ -55,13 +59,10 @@ struct PlayerState {
     DWORD currentAmmo;        // 48-51 (0-30)
     DWORD reserveAmmo;        // 52-55 (0-200)
 
-    // Integrity section [56-79]
+    // Timing section [56-79] (maintains 80-byte layout)
     ULONGLONG lastUpdate;     // 56-63 (QPC timestamp)
-    ULONGLONG lastPositionUpdate; // 64-71
-    BYTE checksum;            // 72
-    BYTE canary;              // 73 (anti-overflow sentinel)
-    WORD securityFlags;       // 74-75 (future expansion)
-    DWORD padding;            // 76-79 (EXACT 80-BYTE ALIGNMENT)
+    ULONGLONG lastAmmoRefill; // 64-71 (QPC timestamp for ammo refill)
+    ULONGLONG lastHealthEvent; // 72-79 (QPC timestamp for health cycle)
 };
 static_assert(sizeof(PlayerState) == 80, "CRITICAL: PlayerState MUST be exactly 80 bytes");
 #pragma pack(pop)
@@ -75,13 +76,6 @@ PlayerState* g_playerState = nullptr;
 ULONGLONG g_qpcFreq = 0;
 PSET_PROCESS_MITIGATION_POLICY g_pSetProcessMitigationPolicy = nullptr;
 std::mt19937 g_rng; // Random number generator for physics
-
-const DWORD DEBUG_TRIP_ADDRESSES[] = {
-    0x7FFE0000,  // KUSER_SHARED_DATA
-    0x7FFD0000,  // Alternate debug region
-    0x7FFE0300   // System time fields
-};
-const size_t DEBUG_TRIP_COUNT = _countof(DEBUG_TRIP_ADDRESSES);
 
 // ======================
 // SAFE MEMORY ACCESS UTILITY (SEH COMPATIBLE)
@@ -97,7 +91,7 @@ inline bool SafeReadByte(const volatile void* address, BYTE& value) {
 }
 
 // ======================
-// SECURITY ENHANCEMENTS
+// SECURITY ENHANCEMENTS (SYSTEM-LEVEL ONLY)
 // ======================
 void ApplyProcessMitigations() {
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
@@ -107,8 +101,7 @@ void ApplyProcessMitigations() {
         GetProcAddress(hKernel32, "SetProcessMitigationPolicy");
 
     if (!g_pSetProcessMitigationPolicy) {
-        std::cerr << "[SECURITY] SetProcessMitigationPolicy unavailable\n";
-        return;
+        return; // Silent fail - not game-critical
     }
 
     PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dynamicPolicy = { 0 };
@@ -118,13 +111,6 @@ void ApplyProcessMitigations() {
     PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY sigPolicy = { 0 };
     sigPolicy.MicrosoftSignedOnly = TRUE;
     g_pSetProcessMitigationPolicy(ProcessSignaturePolicy, &sigPolicy, sizeof(sigPolicy));
-
-    PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY handlePolicy = { 0 };
-    handlePolicy.RaiseExceptionOnInvalidHandleReference = TRUE;
-    handlePolicy.HandleExceptionsPermanentlyEnabled = TRUE;
-    g_pSetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &handlePolicy, sizeof(handlePolicy));
-
-    std::cout << "[SECURITY] All mitigations active\n";
 }
 
 // ======================
@@ -134,18 +120,6 @@ ULONGLONG GetPreciseTime() {
     LARGE_INTEGER li;
     QueryPerformanceCounter(&li);
     return li.QuadPart;
-}
-
-void CalculateChecksum(PlayerState* state) {
-    BYTE* bytes = reinterpret_cast<BYTE*>(state);
-    BYTE sum = 0;
-
-    for (size_t i = 0; i < sizeof(PlayerState); ++i) {
-        if (i >= 4 && i <= 7) continue;  // Skip score field
-        if (i == 72) continue;            // Skip checksum field
-        sum += bytes[i];
-    }
-    state->checksum = sum;
 }
 
 void NormalizeYaw(FLOAT& yaw) {
@@ -160,14 +134,6 @@ void NormalizePitch(FLOAT& pitch) {
     pitch = fmaxf(-90.0f, fminf(90.0f, pitch));
 }
 
-FLOAT CalculatePositionDistance(const Vector3& a, const Vector3& b) {
-    return sqrtf(
-        (a.x - b.x) * (a.x - b.x) +
-        (a.y - b.y) * (a.y - b.y) +
-        (a.z - b.z) * (a.z - b.z)
-    );
-}
-
 void UpdateGameState() {
     WaitForSingleObject(g_gameMutex, INFINITE);
 
@@ -178,9 +144,49 @@ void UpdateGameState() {
         sessionEpoch = GetPreciseTime();
     }
 
-    // Core gameplay
+    // Core gameplay: score always increments
     InterlockedIncrement(&g_playerState->score);
-    g_playerState->health = fmaxf(0.0f, g_playerState->health - 0.01f);
+
+    // Health cycle: 10s stable -> 1s drain -> 5s recovery
+    ULONGLONG now = GetPreciseTime();
+    static bool isDraining = false;
+    static bool isRecovering = false;
+    static FLOAT recoveryStartHealth = 100.0f;
+
+    DWORD timeSinceLastHealthEvent = static_cast<DWORD>((now - g_playerState->lastHealthEvent) * 1000 / g_qpcFreq);
+
+    if (!isDraining && !isRecovering) {
+        // Stable phase (10 seconds)
+        if (!isDraining && timeSinceLastHealthEvent > HEALTH_DRAIN_INTERVAL_MS) {
+            isDraining = true;
+        }
+    }
+
+    if (isDraining) {
+        // Rapid drain phase (1 second, drain 30% health)
+        if (timeSinceLastHealthEvent > HEALTH_DRAIN_INTERVAL_MS + HEALTH_DRAIN_DURATION_MS) {
+            g_playerState->health = fmaxf(0.0f, 70.0f); // Instant drain to 70%
+            isDraining = false;
+            isRecovering = true;
+            recoveryStartHealth = 70.0f;
+        }
+    }
+
+    if (isRecovering) {
+        // Linear recovery phase (5 seconds back to 100%)
+        DWORD recoveryTime = static_cast<DWORD>((now - g_playerState->lastHealthEvent) * 1000 / g_qpcFreq)
+            - HEALTH_DRAIN_INTERVAL_MS - HEALTH_DRAIN_DURATION_MS;
+
+        if (recoveryTime <= HEALTH_RECOVERY_DURATION_MS) {
+            FLOAT recoveryProgress = static_cast<FLOAT>(recoveryTime) / HEALTH_RECOVERY_DURATION_MS;
+            g_playerState->health = recoveryStartHealth + (100.0f - recoveryStartHealth) * recoveryProgress;
+        }
+        else {
+            g_playerState->health = 100.0f;
+            isRecovering = false;
+            g_playerState->lastHealthEvent = now; // Reset cycle
+        }
+    }
 
     // Position simulation (circular movement with gravity)
     static FLOAT angle = 0.0f;
@@ -198,12 +204,12 @@ void UpdateGameState() {
     if (!isJumping && (angle > 3.0f || angle < -3.0f)) {
         if (static_cast<float>(rand()) / RAND_MAX < 0.05f) { // 5% chance to jump
             isJumping = true;
-            jumpStartTime = GetPreciseTime();
+            jumpStartTime = now;
         }
     }
 
     if (isJumping) {
-        ULONGLONG elapsed = GetPreciseTime() - jumpStartTime;
+        ULONGLONG elapsed = now - jumpStartTime;
         FLOAT t = static_cast<FLOAT>(elapsed) / g_qpcFreq; // Time in seconds
 
         // Parabolic jump trajectory
@@ -239,11 +245,11 @@ void UpdateGameState() {
 
     // 95% of time: near horizontal (-5° to 5°)
     // 5% of time: ±30° jumps (simulating jump/crouch)
-    if (GetPreciseTime() - lastPitchJump > g_qpcFreq * 5.0f && (rand() % 100) < 5) {
+    if (now - lastPitchJump > g_qpcFreq * 5.0f && (rand() % 100) < 5) {
         pitchBase = (rand() % 2 == 0) ? JUMP_PITCH_OFFSET : -JUMP_PITCH_OFFSET;
-        lastPitchJump = GetPreciseTime();
+        lastPitchJump = now;
     }
-    else if (GetPreciseTime() - lastPitchJump > g_qpcFreq * 0.5f) {
+    else if (now - lastPitchJump > g_qpcFreq * 0.5f) {
         pitchBase = (static_cast<float>(rand()) / RAND_MAX * 10.0f) - 5.0f; // -5° to 5°
     }
 
@@ -252,12 +258,10 @@ void UpdateGameState() {
     g_playerState->pitch = pitchBase + tremor;
     NormalizePitch(g_playerState->pitch);
 
-    // Ammo simulation with realistic reload
+    // Ammo simulation with realistic reload AND full refill after depletion
     static DWORD lastShotTime = 0;
     static bool isReloading = false;
     static ULONGLONG reloadStartTime = 0;
-
-    ULONGLONG now = GetPreciseTime();
 
     // Handle reload completion
     if (isReloading && (now - reloadStartTime) >= (RELOAD_DURATION_MS * g_qpcFreq / 1000)) {
@@ -280,17 +284,24 @@ void UpdateGameState() {
         }
     }
 
-    // Integrity timestamps
-    if (CalculatePositionDistance(oldPos, g_playerState->position) > 0.1f) {
-        g_playerState->lastPositionUpdate = now;
+    // Full ammo refill after complete depletion (0/0 state)
+    if (g_playerState->currentAmmo == 0 && g_playerState->reserveAmmo == 0) {
+        if (g_playerState->lastAmmoRefill == 0) {
+            g_playerState->lastAmmoRefill = now; // Mark depletion start time
+        }
+        else if ((now - g_playerState->lastAmmoRefill) >= (AMMO_REFILL_DELAY_MS * g_qpcFreq / 1000)) {
+            // Refill after 10 seconds
+            g_playerState->currentAmmo = 30;
+            g_playerState->reserveAmmo = 60;
+            g_playerState->lastAmmoRefill = 0; // Reset refill timer
+        }
     }
+    else {
+        g_playerState->lastAmmoRefill = 0; // Reset if ammo was replenished
+    }
+
+    // Update timestamps (game logic only)
     g_playerState->lastUpdate = now;
-
-    // Canary protection
-    g_playerState->canary = static_cast<BYTE>(GetTickCount64() & 0xFF);
-
-    // Recalculate checksum
-    CalculateChecksum(g_playerState);
 
     ReleaseMutex(g_gameMutex);
 }
@@ -310,7 +321,8 @@ void RenderGameScreen() {
     );
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), topLeft);
 
-    std::cout << "=== VMX-SENTINEL SANDBOX v2.4 (PID: " << GetCurrentProcessId() << ") ===\n\n";
+    // PID displayed in decimal as requested
+    std::cout << "=== VMX-SENTINEL SANDBOX v3.1 (PID: " << GetCurrentProcessId() << ") ===\n\n";
     std::cout << "Player State Address: 0x" << std::hex << reinterpret_cast<uintptr_t>(g_playerState) << std::dec << "\n";
     std::cout << "Session ID: " << g_playerState->sessionId << "\n";
     std::cout << "Score: " << g_playerState->score << " (0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->score) << ")\n";
@@ -335,109 +347,27 @@ void RenderGameScreen() {
         << "(0x" << std::hex << reinterpret_cast<uintptr_t>(&g_playerState->currentAmmo)
         << "/0x" << reinterpret_cast<uintptr_t>(&g_playerState->reserveAmmo) << ")\n";
 
-    std::cout << "\n[INTEGRITY PROTECTORS]\n";
-    std::cout << "Canary Value: 0x" << std::hex << static_cast<int>(g_playerState->canary) << std::dec << "\n";
-    std::cout << "Memory Checksum: 0x" << std::hex << static_cast<int>(g_playerState->checksum) << std::dec << "\n";
-    std::cout << "Position Update: " << (GetPreciseTime() - g_playerState->lastPositionUpdate) / static_cast<double>(g_qpcFreq) << "s ago\n";
+    std::cout << "\n[MEMORY LAYOUT - CRITICAL FOR ANALYSIS]\n";
+    std::cout << "* Session ID:     DWORD @ offset 0   (0x" << std::hex << offsetof(PlayerState, sessionId) << ")\n";
+    std::cout << "* Score:          LONG  @ offset 4   (0x" << offsetof(PlayerState, score) << ")\n";
+    std::cout << "* Health:         FLOAT @ offset 8   (0x" << offsetof(PlayerState, health) << ")\n";
+    std::cout << "* PlayerName:     CHAR[16] @ offset 12 (0x" << offsetof(PlayerState, playerName) << ")\n";
+    std::cout << "* Position.x:     FLOAT @ offset 28  (0x" << offsetof(PlayerState, position) << ")\n";
+    std::cout << "* Position.y:     FLOAT @ offset 32\n";
+    std::cout << "* Position.z:     FLOAT @ offset 36\n";
+    std::cout << "* Pitch:          FLOAT @ offset 40  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->pitch) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
+    std::cout << "* Yaw:            FLOAT @ offset 44  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->yaw) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
+    std::cout << "* CurrentAmmo:    DWORD @ offset 48  (0x" << offsetof(PlayerState, currentAmmo) << ")\n";
+    std::cout << "* ReserveAmmo:    DWORD @ offset 52  (0x" << offsetof(PlayerState, reserveAmmo) << ")\n";
+    std::cout << "* LastUpdate:     ULONGLONG @ offset 56\n";
 
-    std::cout << "\n[ATTACK SURFACE MAP]\n";
-    std::cout << "High Value Targets:\n";
-    std::cout << "  • Score (4 bytes)      @ offset 4\n";
-    std::cout << "  • Health (4 bytes)     @ offset 8\n";
-    std::cout << "  • Position (12 bytes)  @ offset 28\n";
-    std::cout << "  • Rotation (8 bytes)   @ offset 40 (Pitch/Yaw)\n";
-    std::cout << "  • Ammo (8 bytes)       @ offset 48\n";
-    std::cout << "[!] Red team: All addresses are volatile - session rotation active\n";
-    std::cout << "[!] Blue team: Monitor pitch/yaw acceleration for aimbots\n";
-    std::cout << "[!] Ammo reloads take 300ms - detect instant reloads!\n";
-    std::cout << "[!] Press ESC to exit...\n";
-}
-
-// ======================
-// SEH-COMPATIBLE DEBUG TRAP MONITOR
-// ======================
-void DebugTrapMonitor() {
-    // Use SafeReadByte function for SEH-safe memory access
-    static BYTE trapValues[DEBUG_TRIP_COUNT] = { 0 };
-
-    for (size_t i = 0; i < DEBUG_TRIP_COUNT; ++i) {
-        BYTE currentValue;
-        if (SafeReadByte(reinterpret_cast<const void*>(DEBUG_TRIP_ADDRESSES[i]), currentValue)) {
-            if (trapValues[i] == 0) {
-                trapValues[i] = currentValue;
-            }
-            else if (trapValues[i] != currentValue) {
-                std::cerr << "\n[ALERT] Tripwire @ 0x" << std::hex << DEBUG_TRIP_ADDRESSES[i]
-                    << ": 0x" << static_cast<int>(trapValues[i])
-                    << " -> 0x" << static_cast<int>(currentValue) << "\n";
-                trapValues[i] = currentValue;
-            }
-        }
-        // If SafeReadByte fails, silently ignore (memory not readable)
-    }
-
-    // Canary integrity check
-    static BYTE lastCanary = 0;
-    if (g_playerState) {
-        if (lastCanary != 0 && g_playerState->canary != lastCanary) {
-            std::cerr << "\n[SECURITY BREACH] Canary value altered! (0x"
-                << std::hex << static_cast<int>(lastCanary)
-                << " -> 0x" << static_cast<int>(g_playerState->canary) << ")\n";
-        }
-        lastCanary = g_playerState->canary;
-
-        // Position velocity analysis (max 10 m/s)
-        static Vector3 lastPos = { 0 };
-        static ULONGLONG lastPosTime = GetPreciseTime();
-        ULONGLONG now = GetPreciseTime();
-        FLOAT deltaTime = static_cast<FLOAT>(now - lastPosTime) / g_qpcFreq;
-
-        if (deltaTime > 0.0f) {
-            FLOAT distance = CalculatePositionDistance(lastPos, g_playerState->position);
-            FLOAT velocity = distance / deltaTime;
-
-            if (velocity > 10.0f) { // 10 m/s max human speed
-                std::cerr << "\n[MOVEMENT ANOMALY] Velocity: "
-                    << std::fixed << std::setprecision(2) << velocity << " m/s (threshold: 10.0)\n";
-            }
-        }
-
-        lastPos = g_playerState->position;
-        lastPosTime = now;
-
-        // Pitch/Yaw acceleration analysis
-        static FLOAT lastPitch = 0.0f;
-        static FLOAT lastYaw = 0.0f;
-        static ULONGLONG lastRotTime = GetPreciseTime();
-
-        FLOAT deltaPitch = fabsf(g_playerState->pitch - lastPitch);
-        FLOAT deltaYaw = fabsf(g_playerState->yaw - lastYaw);
-        FLOAT rotDeltaTime = static_cast<FLOAT>(now - lastRotTime) / g_qpcFreq;
-
-        if (rotDeltaTime > 0.001f) {
-            FLOAT pitchAccel = deltaPitch / (rotDeltaTime * rotDeltaTime);
-            FLOAT yawAccel = deltaYaw / (rotDeltaTime * rotDeltaTime);
-
-            // Pitch: max 300 deg/s² (human limit)
-            if (pitchAccel > MAX_PITCH_ACCEL) {
-                std::cerr << "\n[AIMBOT DETECTED] Pitch acceleration: "
-                    << std::fixed << std::setprecision(1) << pitchAccel
-                    << " deg/s² (threshold: " << MAX_PITCH_ACCEL << ")\n";
-            }
-
-            // Yaw: max 120 deg/s (human wrist limit)
-            FLOAT yawVel = deltaYaw / rotDeltaTime;
-            if (yawVel > MAX_YAW_PER_SECOND) {
-                std::cerr << "\n[AIMBOT DETECTED] Yaw velocity: "
-                    << std::fixed << std::setprecision(1) << yawVel
-                    << " deg/s (threshold: " << MAX_YAW_PER_SECOND << ")\n";
-            }
-        }
-
-        lastPitch = g_playerState->pitch;
-        lastYaw = g_playerState->yaw;
-        lastRotTime = now;
-    }
+    std::cout << "\n[GAME MECHANICS]\n";
+    std::cout << "* Session rotates every 30 seconds\n";
+    std::cout << "* Health: 10s stable -> 1s drain (30%) -> 5s recovery\n";
+    std::cout << "* Ammo: Full refill after 10 seconds at 0/0 state\n";
+    std::cout << "* Realistic reload time: 300ms\n";
+    std::cout << "* Human-limited aiming (120 deg/s max)\n";
+    std::cout << "\nPress ESC to exit...\n";
 }
 
 void GameMainThread() {
@@ -473,22 +403,19 @@ void GameMainThread() {
     g_playerState->currentAmmo = 30;
     g_playerState->reserveAmmo = 60;
     g_playerState->lastUpdate = GetPreciseTime();
-    g_playerState->lastPositionUpdate = GetPreciseTime();
-    g_playerState->canary = static_cast<BYTE>(GetTickCount64() & 0xFF);
-    CalculateChecksum(g_playerState);
+    g_playerState->lastHealthEvent = GetPreciseTime(); // Start health cycle
 
     // Console setup
-    SetConsoleTitleA("VMX-Sentinel v4.2 (FPS Physics Edition)");
+    SetConsoleTitleA("VMX-Sentinel v3.1 (Game Logic Only)");
     CONSOLE_FONT_INFOEX font = { sizeof(font) };
     font.dwFontSize.Y = 16;
-    wcscpy_s(font.FaceName, L"Consolas");
+    wcscpy_s(font.FaceName, L"Lucida Console");
     SetCurrentConsoleFontEx(GetStdHandle(STD_OUTPUT_HANDLE), FALSE, &font);
 
     // Main loop
     while (!g_exitRequested) {
         UpdateGameState();
         RenderGameScreen();
-        DebugTrapMonitor();
 
         if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
             g_exitRequested = true;
@@ -528,6 +455,6 @@ int main() {
     }
     CloseHandle(g_gameMutex);
 
-    std::cout << "\nVMX-Sentinel shutdown complete. Physics data preserved for analysis.\n";
+    std::cout << "\nVMX-Sentinel shutdown complete.\n";
     return 0;
 }
