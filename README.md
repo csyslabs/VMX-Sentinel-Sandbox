@@ -85,7 +85,7 @@ cl /EHsc /O2 /std:c++17 /fp:fast main.cpp /link /subsystem:console
 
 ## Research Value
 
-VMX-SENTINEL represents the state-of-the-art in 2077 game protection architecture by:
+VMX-SENTINEL represents the state-of-the-art in 2026 game protection architecture by:
 
 1. **Isolating game logic from detection**: Pure game mechanics without embedded anti-cheat code
 2. **Providing clear memory targets**: Well-defined structure with documented offsets
