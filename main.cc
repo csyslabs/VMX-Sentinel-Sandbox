@@ -391,24 +391,24 @@ void RenderGameScreen() {
         << "/0x" << reinterpret_cast<uintptr_t>(&g_playerState->reserveAmmo) << ")\n";
 
     oss << "\n[MEMORY LAYOUT - CRITICAL FOR ANALYSIS]\n";
-    oss << "* Session ID:     DWORD @ offset 0   (0x" << std::hex << offsetof(PlayerState, sessionId) << ")\n";
-    oss << "* Score:          LONG  @ offset 4   (0x" << offsetof(PlayerState, score) << ")\n";
-    oss << "* Health:         FLOAT @ offset 8   (0x" << offsetof(PlayerState, health) << ")\n";
-    oss << "* PlayerName:     CHAR[16] @ offset 12 (0x" << offsetof(PlayerState, playerName) << ")\n";
-    oss << "* Position.x:     FLOAT @ offset 28  (0x" << offsetof(PlayerState, position) << ")\n";
-    oss << "* Position.y:     FLOAT @ offset 32\n";
-    oss << "* Position.z:     FLOAT @ offset 36\n";
-    oss << "* Pitch:          FLOAT @ offset 40  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->pitch) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
-    oss << "* Yaw:            FLOAT @ offset 44  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->yaw) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
-    oss << "* CurrentClip:    DWORD @ offset 48  (0x" << offsetof(PlayerState, currentClip) << ")\n";
-    oss << "* ReserveAmmo:    DWORD @ offset 52  (0x" << offsetof(PlayerState, reserveAmmo) << ")\n";
-    oss << "* LastUpdate:     ULONGLONG @ offset 56\n";
+    oss << "    * Session ID:     DWORD @ offset 0   (0x" << std::hex << offsetof(PlayerState, sessionId) << ")\n";
+    oss << "    * Score:          LONG  @ offset 4   (0x" << offsetof(PlayerState, score) << ")\n";
+    oss << "    * Health:         FLOAT @ offset 8   (0x" << offsetof(PlayerState, health) << ")\n";
+    oss << "    * PlayerName:     CHAR[16] @ offset 12 (0x" << offsetof(PlayerState, playerName) << ")\n";
+    oss << "    * Position.x:     FLOAT @ offset 28  (0x" << offsetof(PlayerState, position) << ")\n";
+    oss << "    * Position.y:     FLOAT @ offset 32\n";
+    oss << "    * Position.z:     FLOAT @ offset 36\n";
+    oss << "    * Pitch:          FLOAT @ offset 40  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->pitch) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
+    oss << "    * Yaw:            FLOAT @ offset 44  (0x" << reinterpret_cast<uintptr_t>(&g_playerState->yaw) - reinterpret_cast<uintptr_t>(g_playerState) << ")\n";
+    oss << "    * CurrentClip:    DWORD @ offset 48  (0x" << offsetof(PlayerState, currentClip) << ")\n";
+    oss << "    * ReserveAmmo:    DWORD @ offset 52  (0x" << offsetof(PlayerState, reserveAmmo) << ")\n";
+    oss << "    * LastUpdate:     ULONGLONG @ offset 56\n";
 
     oss << "\n[FPS PHYSICS PARAMETERS]\n";
-    oss << "* Human yaw limit: 120 deg/s | Pitch accel: 300 deg/s^2\n";
-    oss << "* Jump pitch offset: ±30 deg | Reload time: 300ms\n";
-    oss << "* Health cycle: 10s stable → 1s drain (30%) → 5s recovery\n";
-    oss << "* Ammo refill: 10s after complete depletion\n";
+    oss << "    * Human yaw limit: 120 deg/s | Pitch accel: 300 deg/s^2\n";
+    oss << "    * Jump pitch offset: ±30 deg | Reload time: 300ms\n";
+    oss << "    * Health cycle: 10s stable → 1s drain (30%) → 5s recovery\n";
+    oss << "    * Ammo refill: 10s after complete depletion\n";
 
     RenderToBuffer(oss.str());
     SwapBuffers();
